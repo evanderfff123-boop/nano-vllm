@@ -12,7 +12,9 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
 class Qwen3Attention(nn.Module):
-
+    """
+    带分布式支持和 GQA 机制的注意力层
+    """
     def __init__(
         self,
         hidden_size: int,
@@ -26,6 +28,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
+        # 初始化 TP (Tensor Parallel) 大小
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -38,7 +41,7 @@ class Qwen3Attention(nn.Module):
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
         self.qkv_bias = qkv_bias
-
+        # QKV 投影：将 Q, K, V 的线性层合并为一个，减少通信频次
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -46,6 +49,7 @@ class Qwen3Attention(nn.Module):
             self.total_num_kv_heads,
             bias=qkv_bias,
         )
+        # 输出投影：将多头的结果合并回 hidden_size
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -59,12 +63,14 @@ class Qwen3Attention(nn.Module):
             max_position=max_position,
             base=rope_theta,
         )
+        # Attention 核心计算算子
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
         )
+        # 如果没有 bias，则在 Attention 内部进行 Norm (Q/K Norm)
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -75,16 +81,16 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1) # 拆分 QKV
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
-        if not self.qkv_bias:
+        if not self.qkv_bias: # 如果启用 QK Norm，在此处标准化
             q = self.q_norm(q)
             k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o.flatten(1, -1))
+        q, k = self.rotary_emb(positions, q, k) # 应用 RoPE
+        o = self.attn(q, k, v) # 计算 Attention
+        output = self.o_proj(o.flatten(1, -1)) # 输出映射
         return output
 
 
@@ -118,7 +124,9 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-
+    """
+    解码器层：包含 Attention + MLP + RMSNorm
+    """
     def __init__(
         self,
         config: Qwen3Config,
@@ -149,18 +157,24 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # 算子融合：RMSNorm 计算同时更新 residual，节省显存带宽
         if residual is None:
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # Self-Attention
         hidden_states = self.self_attn(positions, hidden_states)
+        # Post-Attention Norm
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # MLP (SwiGLU)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
 class Qwen3Model(nn.Module):
-
+    """
+    模型主体：嵌入层 + N 个 Decoder 层 + 最终 Norm
+    """
     def __init__(
         self,
         config: Qwen3Config,

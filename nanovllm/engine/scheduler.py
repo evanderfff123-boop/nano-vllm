@@ -31,77 +31,115 @@ class Scheduler:
     def schedule(self) -> tuple[list[Sequence], bool]:
         """
         核心调度算法：决定这一步跑哪些请求
+
+        vLLM 中一个 "step" 可以是 Prefill 或者 Decode，但不会同时混跑。
+        每次调用 schedule() 只产出一种类型的工作。
+
+        max_num_batched_tokens: 一个 step 能处理的最大 token 总数（硬上限）。
+        max_num_seqs:          一个 step 能处理的最大序列数（硬上限）。
+
         返回: (选中的序列列表, 是否是 Prefill 阶段)
         """
-        scheduled_seqs = []
-        num_batched_tokens = 0
+        scheduled_seqs: list[Sequence] = []  # 本轮选中要执行的序列
+        num_batched_tokens: int = 0           # 本轮已经累计了多少 token
 
-        # prefill
-        # --- 阶段 1: 优先处理 Prefill (首词填充/计算 Prompt) ---
+        # ========== 阶段 1: Prefill（首词填充） ==========
+        # 只要有 waiting 序列，优先做 prefill，不做 decode。
+        # 因为 decode 依赖完整的 KV cache，不先算完 prompt 就无法进行。
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.waiting[0]
+            seq = self.waiting[0]  # peek 队首，不弹出（可能只算了 chunk 还没算完）
+
+            # remaining = 本轮 batch 还能塞多少 token
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
-                break
+                break  # batch 已经满了，不能再加更多 token
 
-            # 如果请求还没分配过显存块
+            # ---------- 计算这个 seq 还剩多少 token 要算 ----------
             if not seq.block_table:
-                # 检查显存是否足够分配给这个新的 Prompt
+                # 这个 seq 还没分配过任何物理块（首次处理）
+                # 先去问 block_manager 能不能分配，同时获取 prefix cache 命中的块数
                 num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1: # 显存完全不够了
+                if num_cached_blocks == -1:
+                    # block_manager 说显存彻底不够了，停
                     break
-                # 计算还需要计算多少 Token (Prompt 长度 - 已经缓存的块对应的 Token)
+                # 该 seq 总共还剩多少 token 要算 =
+                #   总 prompt 长度 - 已缓存的物理块所覆盖的 token 数
+                # Q: 如果这个seq没有分配过物理块，为什么还要计算该seq还剩下多少token要算呢，不是代表没算过吗 ?
+                # A: can_allocate(seq)做过了prefix cache匹配
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
+                # 这个 seq 已经分配过物理块（之前算过 chunk，没算完）
+                # 还剩的 token = 总 prompt 长度 - 累计已算完的 token 数
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
 
-            # Chunked Prefill 逻辑：如果剩下的 Token 额度塞不下整个 Prompt
-            # 只有当 scheduled_seqs 为空（即当前 batch 第一个请求）时才允许切分 Prompt
-            if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
+            # ---------- Chunked Prefill 判断 ----------
+            # 场景: remaining < num_tokens，即 batch 剩余额度装不下整个 prompt。
+            # 策略: 如果 scheduled_seqs 为空，说明这个 seq 是 batch 里的第一个，
+            #       允许切分（chunk），算一部分，剩下的等下一轮。
+            #       如果 scheduled_seqs 已经有别的序列了，不切分，而是 break，
+            #       让这个 seq 等下一轮再做，避免一个大 prompt 占满 batch 饿死其他请求。
+            if remaining < num_tokens and scheduled_seqs:
                 break
 
-            # 真正分配显存物理块
+            # ---------- 分配物理块（只有首次需要） ----------
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
 
-            # 计算本次迭代能处理多少个 Token (如果 Prompt 太长，就只处理一部分)
+            # ---------- 确定本轮实际算多少 token ----------
+            # 能全算完就全算完，否则只算 remaining 这么多（chunked prefill）
             seq.num_scheduled_tokens = min(num_tokens, remaining)
-            num_batched_tokens += seq.num_scheduled_tokens
+            num_batched_tokens += seq.num_scheduled_tokens  # 累加到 batch 计数
 
-            # 如果整个 Prompt 都处理完了，将其从等待队列移到运行队列
+            # ---------- 判断这个 seq 的 prefill 是否全部完成 ----------
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                # 所有 prompt token 都算完了，从 waiting → running
                 seq.status = SequenceStatus.RUNNING
-                self.waiting.popleft()
-                self.running.append(seq)
+                self.waiting.popleft()   # 从 waiting 弹出
+                self.running.append(seq) # 加入 running，下轮开始 decode
+            # 没算完的话，seq 仍然留在 waiting 队首，下次 schedule 继续算
+            # Q: scheduled_seqs代表了什么，seq又代表了什么，为什么不管这个seq的prefill完成与否，都会加到scheduled_seqs中
+            # A: seq = 当前正在处理的这一个请求（序列）。它代表 waiting 队列里的某一个具体请求。
+            # scheduled_seqs = 本轮要交给 engine 实际执行的序列列表。engine 拿到它之后会调用 model_runner.run(scheduled_seqs, is_prefill) 做真正的计算。
+            #两种情况都要算：
+            #   - prefill 没完成（chunked）：这轮算了 num_scheduled_tokens 个 token，当然要交给 engine 去前向传播，生成 KV cache。不然 chunk 切出来干嘛？
+            #   - prefill 完成了：还是一样要交给 engine 去算这轮的 token。区别只在算完之后把它从 waiting 挪到 running，下轮开始 decode。
             scheduled_seqs.append(seq)
 
-        # 如果有 Prefill 任务，这一步就只做 Prefill
+        # 本轮只要调度到了任何 prefill 工作，就只做 prefill，不做 decode
         if scheduled_seqs:
             return scheduled_seqs, True
 
-        # --- 阶段 2: 如果没有 Prefill，则处理 Decode (增量生成) ---
+        # ========== 阶段 2: Decode（逐个生成） ==========
+        # 只有 waiting 队列空了，或者显存不够分配新的 prefill 时，才会走到这里
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
-            seq = self.running.popleft()
+            seq = self.running.popleft()  # 从队首取一个 decode 序列
 
-            # 检查显存是否足够再多存 1 个生成的 Token
+            # 检查：这个 seq 再生成 1 个 token 的话，显存够不够存它对应的 KV cache？
             while not self.block_manager.can_append(seq):
-                # 显存不足！执行【抢占】机制 (Preemption)
-                # 踢掉运行队列末尾的一个请求，腾出显存给当前的 seq
+                # 不够 → 触发抢占（preemption）：踢掉一个序列，腾出显存块
                 if self.running:
+                    # 优先踢运行队列末尾的序列（最晚被调度的，牺牲最小）
                     self.preempt(self.running.pop())
                 else:
-                    self.preempt(seq) # 连自己都跑不动了，直接踢掉自己 
-                    break
+                    # running 队列只剩当前这个序列了，连自己也得被踢掉
+                    self.preempt(seq)
+                    break  # 跳出内层 while，也跳过了 else 分支
             else:
-                # 显存足够，安排生成 1 个 Token
+                # while 条件为 False（can_append 返回 True），说明显存够
+                # decode 阶段每个序列每轮只生成 1 个 token
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
-                self.block_manager.may_append(seq) # 预分配/标记要增加的块
+                # 预标记：这个序列即将用到的新物理块（实际还没写入，先占个位）
+                self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        # 极端情况：所有请求都被抢占了
-        assert scheduled_seqs
-        # 将本次处理的 Decode 请求重新放回 running 队列开头，准备下一轮
+
+        # 如果所有序列都被抢占踢掉了，scheduled_seqs 为空 → 断言失败，说明显存爆了
+        assert scheduled_seqs, "所有请求都被抢占，没有可执行的序列"
+
+        # 把本轮选中的 decode 序列放回 running 队列队首（保持原顺序）
+        # running 队列的序列会反复进出：每次 popleft 取一个，算完再放回
         self.running.extendleft(reversed(scheduled_seqs))
+
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):

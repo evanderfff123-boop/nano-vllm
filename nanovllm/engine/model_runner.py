@@ -153,50 +153,91 @@ class ModelRunner:
     # --- 推理准备逻辑 ---
     def prepare_prefill(self, seqs: list[Sequence]):
         """
-        准备 Prefill（预填充）阶段的数据。这是处理输入 Prompt 的阶段。
-        计算 Slot Mapping（Token 应该存放在 KV Cache 池的哪个位置）。
+        准备 Prefill 阶段送入 GPU 的数据。
+
+        flash_attn_varlen_func 需要 4 类输入:
+          1. input_ids / positions — 要计算的 token 及它们的位置编码
+          2. cu_seqlens — 变长 batch 中每个序列的起始/结束偏移（用于 flash attention）
+          3. slot_mapping — 每个 token 的 KV cache 应该写入显存池的哪个位置（PagedAttention 核心）
+          4. block_tables — prefix cache 场景下，attention 需要读取历史的 KV cache，
+             通过 block_table 找到对应的物理块位置
         """
-        # ... 构建 input_ids, positions, cu_seqlens 等 PagedAttention 所需的元数据 ...
-        # set_context 会将这些元数据存入全局上下文，底层的 Attention Kernel 会读取它们
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-        block_tables = None
+        # 为每类元数据分别构造列表，最后统一转 Tensor
+        input_ids = []       # 本轮所有 seq 要算的 token id，flatten 成一维
+        positions = []       # 每个 token 在原始 prompt 中的位置索引（用于 RoPE）
+        cu_seqlens_q = [0]   # cumsum of query lengths，flash_attn 用它切分变长 batch
+        cu_seqlens_k = [0]   # cumsum of key   lengths，同上
+        max_seqlen_q = 0     # batch 中最长的 query（用于 flash_attn 的内部调度）
+        max_seqlen_k = 0     # batch 中最长的 key（同上）
+        slot_mapping = []    # 每个 token 对应写入 KV cache 池的绝对位置
+        block_tables = None  # 物理块表（只在 prefix cache 场景下传给 attention）
+
         for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
+            # ---- 确定该 seq 本轮要算哪一段 token ----
+            start = seq.num_cached_tokens              # 从哪开始（跳过已缓存的）
+            seqlen_q = seq.num_scheduled_tokens        # 本轮要算多少个 token
+            end = start + seqlen_q                     # 结束位置（开区间）
+            seqlen_k = end                             # key 也是从 0 到 end
+
+            # 1. token 输入和位置编码
+            input_ids.extend(seq[start:end])           # flatten: 所有 seq 的 token 拼一起
+            positions.extend(range(start, end))        # 每个 token 的绝对位置
+
+            # 2. cu_seqlens — 变长 batch 的分段标记
+            #    flash_attn 不接收 [seq1_tokens, seq2_tokens, ...] 这种 list of list，
+            #    而是把全部 token flatten 成一维，然后用 cu_seqlens 记录每段的起止。
+            #    例如 cu_seqlens_q = [0, 5, 8] 表示: seq0 占 [0,5), seq1 占 [5,8)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)  # query: 只到本轮算的 token
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)  # key:   到所有已见的 token
+
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)        # 本 batch 最长的 query
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)        # 本 batch 最长的 key
+
+            # ---- Slot Mapping —— PagedAttention 的核心映射 ----
+            # 每个 token 算出来的 K、V 要写到显存池的具体位置。
+            # 位置不是连续的，而是由 slot_mapping 指定（每个 token 一个 slot）。
+            # slot = block_table[block_idx] * block_size + offset_in_block
+            if not seq.block_table:    # warmup 阶段没有真正的块，跳过
                 continue
+
+            # 这个 seq 本轮涉及的物理块范围
             start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
+            end_block = (end + self.block_size - 1) // self.block_size  # 向上取整
+
             for i in range(start_block, end_block):
+                # 这个物理块在 KV cache 池中的起始地址
                 slot_start = seq.block_table[i] * self.block_size
+
+                # 如果是起始块，可能不是从块的开头开始的（因为 chunked prefill 跳过了一些已缓存的 token）
                 if i == start_block:
                     slot_start += start % self.block_size
+
+                # 结束地址：
+                #   - 中间块直接+ block_size（填满整个块）
+                #   - 最后一块只到 end 对应的位置
                 if i != end_block - 1:
                     slot_end = seq.block_table[i] * self.block_size + self.block_size
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
+
+                # 这块内每个 token 对应一个 slot，取 range 生成
                 slot_mapping.extend(range(slot_start, slot_end))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+
+        # ---- Prefix Cache 场景：attention 需要读取历史的 KV cache ----
+        # 只要还有已缓存的 key（cu_seqlens_k[-1] > cu_seqlens_q[-1]），
+        # 就需要把 block_tables 传给 flash_attn_varlen_func，
+        # 让它在计算 attention 时能去历史块里取 KV。
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
+
+        # ---- 转成 GPU Tensor ----
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
+        # 写入全局上下文，底层 attention kernel 从这里读取
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
