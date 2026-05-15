@@ -52,11 +52,14 @@ class BlockManager:
 
     def _allocate_block(self) -> int:
         """底层分配：从空闲池取出一个块"""
+        # 使用 popleft() 说明 free_block_ids 是一个 collections.deque，这比列表 list 的 pop(0) 操作效率高得多（O(1) 时间复杂度 vs O(n)）。
         block_id = self.free_block_ids.popleft()
         block = self.blocks[block_id]
+        # 确保拿到的是干净的
         assert block.ref_count == 0
         # 如果这个旧块还留在哈希表里，先把它删掉（因为它要被重新改写了）
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
+            # 删除映射，防止后续错误路由
             del self.hash_to_block_id[block.hash]
         block.reset()
         self.used_block_ids.add(block_id)
@@ -73,50 +76,67 @@ class BlockManager:
         检查是否能为新请求分配显存。
         返回：命中的缓存块数量。如果显存不足返回 -1。
         """
-        h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks # 请求总共需要的块数
+        h = -1                          # 初始哈希值
+        num_cached_blocks = 0           # 统计命中了多少个已存在的缓存块
+        num_new_blocks = seq.num_blocks # 这个新请求一共需要的物理块总数
 
-        # 遍历请求的所有逻辑块（除了最后一个可能没满的块）
+        # 遍历请求的所有逻辑块（除了最后一个块，因为最后一个块通常包含未生成的 token，还没完全填满）
         for i in range(seq.num_blocks - 1):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id.get(h, -1)
+            token_ids = seq.block(i)                     # 获取当前逻辑块里的 token
+            h = self.compute_hash(token_ids, h)          # 计算哈希（这是为了快速匹配内存内容）
+            block_id = self.hash_to_block_id.get(h, -1)  # 查找是否已经存在这个内容的块
 
-            # 如果命中缓存，且内容完全一致
+            # 缓存未命中逻辑：
+            # 1. block_id == -1: 完全没见过这个内容
+            # 2. 内容不匹配: 哈希冲突或内容变动
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break
+                break # 只要有一个块不匹配，后续的块就都不用查了，直接停止
+
             num_cached_blocks += 1
-            # 如果这个块已经在被别人用了，新请求就不需要额外占用新的物理块空间
+
+            # 如果这个块已经在被其他请求使用，说明这是“共享内存”
+            # 那么该请求就不需要再申请新的物理块空间，节省了显存开销
+            # 这里指的是物理块
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         
-        # 检查剩余空闲块是否够用
+        # 检查剩余的“空闲显存块”是否足够容纳那些没命中的部分
         if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
+            return -1 # 显存不足，无法接纳该请求
+        return num_cached_blocks  # 返回成功命中的数量
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         """正式为序列分配物理块"""
+        # 确保当前序列还没分配任何块，防止重复分配
         assert not seq.block_table
         h = -1
-        # 处理命中的缓存块
+
+        # 1. 处理“已命中缓存”的块 (Prefix Caching 阶段)
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
+            block_id = self.hash_to_block_id[h] # 根据刚才计算的哈希找到物理块ID
             block = self.blocks[block_id]
+
+            # 如果该块已经在被他人使用 (共享内存)
             if block_id in self.used_block_ids:
-                block.ref_count += 1 # 增加引用计数，实现共享
+                block.ref_count += 1 # 引用计数加1，这是为了防止内存被错误释放
             else:
-                # 这种情况是块在空闲池但哈希还匹配（LRU 命中）
+                # 如果该块虽然存着内容，但当前没人用 (可能是缓存命中，但还未被激活)
                 block.ref_count = 1 
-                self.free_block_ids.remove(block_id)
-                self.used_block_ids.add(block_id)
+                self.free_block_ids.remove(block_id) # 从空闲池中移出
+                self.used_block_ids.add(block_id) # 加入已用池
+
+            # 关键操作：将物理块ID加入序列的 block_table
+            # 以后模型推理读取 KV Cache 时，就是通过这个表去内存里找数据的
             seq.block_table.append(block_id)
-        # 为剩下的部分分配全新的块
+
+        # 2. 为剩下的部分分配“全新的”物理块
         for i in range(num_cached_blocks, seq.num_blocks):
+            # _allocate_block() 会从 free_block_ids 中弹出一个物理块
             seq.block_table.append(self._allocate_block())
+
+        # 记录该序列到底缓存了多少 Token (用于后续性能统计或续写)
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):

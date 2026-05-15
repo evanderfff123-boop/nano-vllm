@@ -70,6 +70,7 @@ class Sequence:
     @property
     def num_blocks(self):
         """根据当前总 Token 数，计算需要多少个物理块 (向上取整)"""
+        # / : 除法； // ：整除
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property

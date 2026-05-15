@@ -40,7 +40,7 @@ class Scheduler:
 
         返回: (选中的序列列表, 是否是 Prefill 阶段)
         """
-        scheduled_seqs: list[Sequence] = []  # 本轮选中要执行的序列
+        scheduled_seqs: list[Sequence] = []   # 本轮选中要执行的序列
         num_batched_tokens: int = 0           # 本轮已经累计了多少 token
 
         # ========== 阶段 1: Prefill（首词填充） ==========

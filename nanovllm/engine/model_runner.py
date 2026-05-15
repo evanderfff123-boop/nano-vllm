@@ -94,10 +94,31 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
+        """
+        跨进程方法调用分发器。
+        
+        设计意图：
+        在张量并行模式下，所有 Rank 必须同步执行相同的推理步骤（如模型前向传播、KV Cache 更新）。
+        为了避免网络通信的复杂性和延迟，采用“主从调度”模式：
+        1. Rank 0 (Master) 决定执行什么方法，并通过共享内存(SHM)向 Worker 广播。
+        2. 其他 Rank (Worker) 通过循环监听 SHM 获取指令并调用本地对应方法。
+        
+        Args:
+            method_name: 要执行的方法名字符串 (如 'run', 'prepare_prefill')。
+            *args: 传递给该方法的参数。
+        """
+        # [分发逻辑] 只有 Rank 0 拥有“指挥权”。
+        # 当 Rank 0 调用某个方法时，它首先将指令序列化写入共享内存。
+        # 此时所有 Worker 进程由于正在调用 call()，也会触发自身的逻辑同步。
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
-        method = getattr(self, method_name, None)
-        return method(*args)
+
+        # [反射执行] 通过 getattr 获取类中的函数引用。
+        # 这里实现了“逻辑一致性”：所有 Rank 的 GPU 进程都会执行相同的模型计算逻辑。
+        # 例如：当 Rank 0 调用 self.run()，所有 Rank 的 GPU 都会同步进行 NCCL AllReduce 计算。
+
+        method = getattr(self, method_name, None) # 从 self 上按名字查找 "run" 这个属性
+        return method(*args) # 调用它 等价于：return self.run(*args)
 
     def warmup_model(self):
         torch.cuda.empty_cache()

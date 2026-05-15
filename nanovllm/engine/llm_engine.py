@@ -16,7 +16,8 @@ class LLMEngine:
     '''
     LLM推理引擎的主控制类，负责管理模型运行、调度和请求处理。
     '''
-
+    # **kwargs代表 “关键字参数字典”。
+    # 允许你传入任意数量、任意名称的参数。
     def __init__(self, model, **kwargs):
         # 1. 提取配置：从传入参数中过滤出 Config 类需要的字段
         config_fields = {field.name for field in fields(Config)}
@@ -30,6 +31,7 @@ class LLMEngine:
         self.events = []  # 存储进程间同步事件
 
         # 3. 初始化多进程环境：使用 "spawn" 模式启动子进程
+        # "spawn" 相比于 "fork" 更干净，不会复制父进程得内存空间
         ctx = mp.get_context("spawn")
 
         # 启动 TP (Tensor Parallel) 的子进程
@@ -104,30 +106,37 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | list[SamplingParams],
-        use_tqdm: bool = True,
+        prompts: list[str] | list[list[int]],       # 支持文本或已转码的 token ID
+        sampling_params: SamplingParams | list[SamplingParams], # 支持统一参数或针对每个请求的不同参数
+        use_tqdm: bool = True, # 是否显示进度条
     ) -> list[str]:
         """
         高层 API：批量处理一组 Prompt 并返回最终生成的文本。
         """
+        # 初始化进度条，总数为请求数
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
 
-        # 规格化采样参数
+        # 规格化采样参数：如果用户只给了一个参数对象，就复制到每个 prompt 上
+        # isinstance检查一个对象是否属于某个特定的类型（或者类）。
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
 
-        # 批量添加请求
+        # 1. 批量添加请求：将所有请求推送到调度器队列
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
-        outputs = {}
-        prefill_throughput = decode_throughput = 0.
+        outputs = {} # 存储最终结果的字典
+        prefill_throughput = decode_throughput = 0. 
 
-        # 核心循环：只要调度器里还有任务，就不断执行 step()
+        # 2. 核心循环：这是推理引擎的“心跳”
+        # 只要调度器中还有未处理完成的任务，就不断循环
         while not self.is_finished():
-            t = perf_counter()
+            t = perf_counter() # 开始计时
+
+            # 执行单步推理（核心逻辑）
+            # output: 已完成的序列结果; num_tokens: 
+            # 返回正数表示 Prefill 处理数，负数表示 Decode 处理数
             output, num_tokens = self.step()
-            dt = perf_counter() - t
+            dt = perf_counter() - t # 结束计时
             
             # 计算并实时更新吞吐量显示
             if num_tokens > 0: # Prefill 阶段
