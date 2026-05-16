@@ -174,14 +174,9 @@ class ModelRunner:
     # --- 推理准备逻辑 ---
     def prepare_prefill(self, seqs: list[Sequence]):
         """
-        准备 Prefill 阶段送入 GPU 的数据。
-
-        flash_attn_varlen_func 需要 4 类输入:
-          1. input_ids / positions — 要计算的 token 及它们的位置编码
-          2. cu_seqlens — 变长 batch 中每个序列的起始/结束偏移（用于 flash attention）
-          3. slot_mapping — 每个 token 的 KV cache 应该写入显存池的哪个位置（PagedAttention 核心）
-          4. block_tables — prefix cache 场景下，attention 需要读取历史的 KV cache，
-             通过 block_table 找到对应的物理块位置
+        [设计逻辑]：FlashAttention 不关心你是哪个序列，它只关心 token 序列的起止位置。
+        [核心冲突]：PagedAttention 需要把 K/V 写入离散的 block 中，而 FlashAttention 需要连续的内存视图。
+        [解决方案]：prepare_prefill 就是在做这种“离散到连续”的地址翻译。
         """
         # 为每类元数据分别构造列表，最后统一转 Tensor
         input_ids = []       # 本轮所有 seq 要算的 token id，flatten 成一维
@@ -195,6 +190,7 @@ class ModelRunner:
 
         for seq in seqs:
             # ---- 确定该 seq 本轮要算哪一段 token ----
+            # 1. 位置翻译：将 seq 内部的 token 转换为全局绝对位置（用于 Rotary Embedding）
             start = seq.num_cached_tokens              # 从哪开始（跳过已缓存的）
             seqlen_q = seq.num_scheduled_tokens        # 本轮要算多少个 token
             end = start + seqlen_q                     # 结束位置（开区间）
@@ -221,12 +217,17 @@ class ModelRunner:
             if not seq.block_table:    # warmup 阶段没有真正的块，跳过
                 continue
 
-            # 这个 seq 本轮涉及的物理块范围
+            # 3. 物理映射 (最难点)：PagedAttention 的 Slot 映射
+            # 每个 token 计算出的 K/V 必须存入特定的显存块(Block)
+            # block_table 记录的是该序列“第几块”被放在“显存池的第几个物理块ID”
+            
+            # 计算该 seq 当前 token 跨越了哪几个物理块
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size  # 向上取整
 
             for i in range(start_block, end_block):
-                # 这个物理块在 KV cache 池中的起始地址
+                # 每一个 i 对应一个物理 block 索引
+                # slot_start 就是该物理块在 GPU 总显存池中的绝对 byte 起始位置
                 slot_start = seq.block_table[i] * self.block_size
 
                 # 如果是起始块，可能不是从块的开头开始的（因为 chunked prefill 跳过了一些已缓存的 token）
@@ -241,7 +242,8 @@ class ModelRunner:
                 else:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
 
-                # 这块内每个 token 对应一个 slot，取 range 生成
+                # 填入 slot_mapping，这最终被传给 CUDA kernel
+                # CUDA kernel 拿到这个映射后，直接写 GPU 显存，跳过 CPU
                 slot_mapping.extend(range(slot_start, slot_end))
 
         # ---- Prefix Cache 场景：attention 需要读取历史的 KV cache ----
@@ -258,7 +260,9 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 
-        # 写入全局上下文，底层 attention kernel 从这里读取
+        # 4. 上下文绑定：将这些计算好的地址表“注入”到全局 Context
+        # 底层的模型层代码会调用 get_context() 获取这些 Tensor，
+        # 并将其传给 FlashAttention kernel 的 workspace 参数。
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
@@ -285,34 +289,75 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
+        """
+        将一组序列对象中的采样参数（温度）转换为 GPU 上的张量。
+        
+        参数:
+            seqs: 一个包含 Sequence 对象的列表，每个对象代表一个正在生成的请求。
+        """
+        
+        # 1. 列表推导式：从 Batch 中的每个序列对象中提取 temperature 属性
+        # temperatures 是一个浮点数列表，例如 [0.7, 1.0, 0.5]
         temperatures = [seq.temperature for seq in seqs]
+        # 2. 转换为 PyTorch 张量
+        # dtype=torch.float32: 确保使用单精度浮点数
+        # pin_memory=True: 开启锁页内存。这是关键优化，
+        # 它可以加快数据从 CPU 内存（Host）拷贝到 GPU 显存（Device）的速度。
+        # 3. 将张量移动到 GPU
+        # .cuda(): 将张量转移到当前 GPU 设备
+        # non_blocking=True: 异步拷贝。
+        # 配合 pin_memory=True 使用，可以让 CPU 在数据拷贝期间继续执行后续逻辑，
+        # 实现计算与通信（数据传输）的并行。
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         """
-        根据情况决定是用普通的 Eager 模式还是 CUDA Graph 模式。
+        模型前向计算主控函数。
+        
+        参数:
+            input_ids: Token ID 序列，形状为 [total_tokens]
+            positions: 每个 Token 对应的位置编码索引
+            is_prefill: 当前是否为预填充阶段（处理 Prompt）
         """
+         # --- 阶段 1: 判断执行模式 ---
+        # 满足以下任意条件，则进入 Eager 模式（即传统的 PyTorch 逐行执行）：
+        # 1. is_prefill: Prefill 阶段序列长度变化剧烈，CUDA Graph 静态形状的特性不适用。
+        # 2. enforce_eager: 用户强制要求不使用 CUDA Graph 的开关。
+        # 3. input_ids.size(0) > 512: Batch 中的 Token 总数过多，可能超出了预录制 Graph 的能力或显存限制。
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            # Prefill 阶段通常不用 CUDA Graph，因为 Sequence 长度变化太大
+            # compute_logits 负责根据 Hidden State 计算最后的概率分布
             return self.model.compute_logits(self.model(input_ids, positions))
+        # --- 阶段 2: Decode 阶段，进入 CUDA Graph 模式 ---
         else:
-            # Decode 阶段使用预先捕获的 CUDA Graph 来加速
+            # 获取当前 Batch 的大小
             bs = input_ids.size(0)
+            # 获取之前存储的元数据上下文
             context = get_context()
-            # 找到合适的 Batch Size 档位
+            # 1. 寻找最合适的 CUDA Graph 档位（Bucket）
+            # CUDA Graph 要求形状固定。为了平衡性能和显存，我们会预录制好几个固定 Batch Size 的 Graph，
+            # 例如 [1, 2, 4, 8, 16...]。这里寻找大于等于当前 bs 的最小预设档位。
             graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            # 2. 获取预留的静态内存缓冲区（Static Buffers）
+            # CUDA Graph 录制的是对固定显存地址的操作，因此我们不能直接传入 input_ids，
+            # 必须将输入数据“搬运”到录制时指定的静态位置。
             graph_vars = self.graph_vars
-            # 将输入数据填充到 CUDA Graph 预留的静态内存中
+            # 将当前步的输入数据拷贝进静态缓冲区（Slice 操作：[:bs]）
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
+            # 设置 PagedAttention 相关的元数据到静态缓冲区
+            graph_vars["slot_mapping"].fill_(-1) # 先填 -1 作为 Padding
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"].zero_() # 长度清零重置
+            # 拷贝 Block Tables（分块表），注意维度切片
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # 3. 重放 CUDA Graph
+            # 这一步不会触发 CPU 上的算子调度逻辑，而是直接命令 GPU 执行之前录制好的全部 Kernel。
+            # 这消除了 Python 的 CPU 开销和 Kernel Launch 的开销。
             graph.replay() # 执行录制好的指令
+            # 4. 从静态输出缓冲区获取结果并返回
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     # --- 核心运行逻辑 ---
@@ -322,6 +367,8 @@ class ModelRunner:
         """
         # 1. 准备数据
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        # 只有主进程（Rank 0）负责准备采样参数，其他进程（从属进程）暂时设为 None
+        # 这通常用于分布式架构（如 Tensor Parallelism），其中主进程负责接收请求和预处理
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
 
         # 2. 模型前向计算
